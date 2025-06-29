@@ -71,7 +71,6 @@ func handleConnection(conn net.Conn) {
 		// Broadcast the message to all other clients
 		broadcastMessage(buffer[:message], conn)
 	}
-	
 }
 
 func broadcastMessage(message []byte, conn net.Conn) {
@@ -85,6 +84,7 @@ func broadcastMessage(message []byte, conn net.Conn) {
 				if err != nil {
 					fmt.Println("Error writing to client:", err)
 				}
-			}
+		}
 	}
+	clientsMu.Unlock()
 }
