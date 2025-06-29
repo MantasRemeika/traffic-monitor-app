@@ -51,7 +51,6 @@ func handleConnection(conn net.Conn) {
 		conn.Close()
 		fmt.Println("Disconnected:", conn.RemoteAddr())
 	}()
-
 	// Handle the connection
 	fmt.Println("Handling connection from", conn.RemoteAddr())
 	buffer := make([]byte, 1024)
