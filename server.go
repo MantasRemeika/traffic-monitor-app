@@ -4,6 +4,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
+)
+
+var (
+	clients   = make(map[net.Conn]bool)
+	clientsMu sync.Mutex
 )
 
 
@@ -25,17 +31,31 @@ func StartServer(port string) {
 			continue
 		}
 
+		// Add the new client to the clients map
+		clientsMu.Lock()
+		clients[conn] = true
+		clientsMu.Unlock()
+
 		// Handle the connection in a separate goroutine
 		go handleConnection(conn)
 	}
 }
 
 func handleConnection(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		// Remove the client from the clients map when done
+		clientsMu.Lock()
+		delete(clients, conn)
+		clientsMu.Unlock()
+
+		conn.Close()
+		fmt.Println("Disconnected:", conn.RemoteAddr())
+	}()
+
 	// Handle the connection
 	fmt.Println("Handling connection from", conn.RemoteAddr())
-
 	buffer := make([]byte, 1024)
+	
 	for {
 		// Read data from the connection
 		message, err := conn.Read(buffer)
@@ -45,7 +65,27 @@ func handleConnection(conn net.Conn) {
 			}
 			return
 		}
+
 		// Print the received data
 		fmt.Println("Received data:", string(buffer[:message]))
+
+		// Broadcast the message to all other clients
+		broadcastMessage(buffer[:message], conn)
+	}
+	
+}
+
+func broadcastMessage(message []byte, conn net.Conn) {
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+
+	// Send the message to all clients except the sender
+	for client := range clients {
+		if client != conn {
+			_, err := client.Write(message)
+				if err != nil {
+					fmt.Println("Error writing to client:", err)
+				}
+			}
 	}
 }
