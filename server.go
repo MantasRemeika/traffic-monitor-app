@@ -2,17 +2,17 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"net"
 	"sync"
 )
 
+const byteLimit = 100 // Limit for upload/download in bytes
 var (
-	clients   = make(map[net.Conn]bool)
+	clients   = make(map[net.Conn]*Client)
 	clientsMu sync.Mutex
 )
 
-
+// StartServer starts the TCP server and listens for incoming connections.
 func StartServer(port string) {
 	// Start the server and listen for incoming connections on the specified port
 	listener, err := net.Listen("tcp", port)
@@ -32,59 +32,40 @@ func StartServer(port string) {
 		}
 
 		// Add the new client to the clients map
+		client := NewClient(conn)
 		clientsMu.Lock()
-		clients[conn] = true
+		clients[conn] = client
 		clientsMu.Unlock()
 
 		// Handle the connection in a separate goroutine
-		go handleConnection(conn)
+		go client.HandleConnection()
 	}
 }
 
-func handleConnection(conn net.Conn) {
-	defer func() {
-		// Remove the client from the clients map when done
-		clientsMu.Lock()
-		delete(clients, conn)
-		clientsMu.Unlock()
-
-		conn.Close()
-		fmt.Println("Disconnected:", conn.RemoteAddr())
-	}()
-	// Handle the connection
-	fmt.Println("Handling connection from", conn.RemoteAddr())
-	buffer := make([]byte, 1024)
-	
-	for {
-		// Read data from the connection
-		message, err := conn.Read(buffer)
-		if err != nil {
-			if err != io.EOF {
-				fmt.Println("Error reading from connection:", err)
-			}
-			return
-		}
-
-		// Print the received data
-		fmt.Println("Received data:", string(buffer[:message]))
-
-		// Broadcast the message to all other clients
-		broadcastMessage(buffer[:message], conn)
-	}
-}
-
-func broadcastMessage(message []byte, conn net.Conn) {
+// BroadcastMessage sends a message to all connected clients except the sender
+// and checks if any client has reached the byte limit.
+func BroadcastMessage(message []byte, sender *Client) {
 	clientsMu.Lock()
 	defer clientsMu.Unlock()
 
 	// Send the message to all clients except the sender
-	for client := range clients {
-		if client != conn {
-			_, err := client.Write(message)
-				if err != nil {
-					fmt.Println("Error writing to client:", err)
-				}
+	for _, client := range clients {
+		if client == sender {
+			continue
+		}
+
+		_, err := client.conn.Write([]byte("Message sent from " + sender.address + ": " + string(message)))
+		if err == nil {
+			client.currentByteSum += len(message)
+		}
+
+		// Check if the client has reached the byte limit
+		// If so, disconnect the client and remove it from the clients map
+		if client.currentByteSum >= byteLimit {
+			fmt.Println("Client", client.address, "has reached the byte limit. Disconnecting...")
+			client.conn.Write([]byte("Traffic limit reached. Disconnecting.\n"))
+			client.conn.Close()
+			delete(clients, client.conn)
 		}
 	}
-	clientsMu.Unlock()
 }

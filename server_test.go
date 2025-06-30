@@ -1,95 +1,112 @@
 package main
 
 import (
-	"bytes"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
 
-// TestServerHandlesMultipleConnections tests if the server can handle multiple simultaneous connections.
-func TestServerHandlesMultipleClientMessages(t *testing.T) {
-	go StartServer(":9000")
-	time.Sleep(200 * time.Millisecond) // Give server time to start
+// TestBroadcastMessage tests if the server correctly broadcasts messages to all clients except the sender.
+func TestBroadcastMessage(t *testing.T) {
+	clientsMu.Lock()
+	clients = make(map[net.Conn]*Client)
+	clientsMu.Unlock()
 
-	const numClients = 5
-	conns := make([]net.Conn, numClients)
-	for i := 0; i < numClients; i++ {
-		conn, err := net.Dial("tcp", "localhost:9000")
-		if err != nil {
-			t.Fatalf("Client %d failed to connect: %v", i, err)
-		}
-		conns[i] = conn
+	c1Conn, s1 := net.Pipe()
+	c2Conn, s2 := net.Pipe()
+
+	defer func() {
+		c1Conn.Close()
+		s1.Close()
+		c2Conn.Close()
+		s2.Close()
+	}()
+
+	client1 := &Client{conn: s1, address: "client1"}
+	client2 := &Client{conn: s2, address: "client2"}
+
+	clientsMu.Lock()
+	clients[s1] = client1
+	clients[s2] = client2
+	clientsMu.Unlock()
+
+	message := []byte("test")
+	go BroadcastMessage(message, client1)
+
+	buf := make([]byte, 1024)
+	receivedMessage, err := c2Conn.Read(buf)
+	if err != nil {
+		t.Fatalf("client2 did not receive broadcast: %v", err)
+	}
+	got := string(buf[:receivedMessage])
+	want := "Message sent from client1: test"
+	if got != want {
+		t.Errorf("expected %q, got %q", want, got)
 	}
 
-	message := "Hello, server!"
-	for _, conn := range conns {
-		_, err := conn.Write([]byte(message))
-		if err != nil {
-			t.Fatalf("Failed to write to server: %v", err)
-		}
-		defer conn.Close()
+	// client1 should not receive its own message
+	c1Conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)) // Set a short deadline to avoid blocking
+	receivedMessage, err = c1Conn.Read(buf)
+	if err == nil && receivedMessage > 0 {
+		t.Errorf("client1 should not receive its own broadcast, but got: %q", string(buf[:receivedMessage]))
 	}
 }
 
-// TestBroadcastMessage tests if broadcastMessage sends data to all clients except the sender.
-func TestBroadcastMessage(t *testing.T) {
-	// Setup dummy connections using net.Pipe
-	sender, senderRemote := net.Pipe()
-	receiver1, receiver1Remote := net.Pipe()
-	receiver2, receiver2Remote := net.Pipe()
-
-	// Add connections to clients map
+// TestBroadcastDisconnectsOnTrafficLimit tests if the server disconnects clients that exceed the traffic limit.
+func TestBroadcastDisconnectsOnTrafficLimit(t *testing.T) {
 	clientsMu.Lock()
-	clients[senderRemote] = true
-	clients[receiver1Remote] = true
-	clients[receiver2Remote] = true
+	clients = make(map[net.Conn]*Client)
 	clientsMu.Unlock()
 
+	c1Conn, s1 := net.Pipe()
+	c2Conn, s2 := net.Pipe()
+
 	defer func() {
-		sender.Close()
-		senderRemote.Close()
-		receiver1.Close()
-		receiver1Remote.Close()
-		receiver2.Close()
-		receiver2Remote.Close()
-		clientsMu.Lock()
-		delete(clients, senderRemote)
-		delete(clients, receiver1Remote)
-		delete(clients, receiver2Remote)
-		clientsMu.Unlock()
+		c1Conn.Close()
+		s1.Close()
+		c2Conn.Close()
+		s2.Close()
 	}()
 
-	message := []byte("Hello world")
-	go broadcastMessage(message, senderRemote)
+	client1 := &Client{conn: s1, address: "client1", currentByteSum: 0}
+	client2 := &Client{conn: s2, address: "client2", currentByteSum: byteLimit - 2} // Set traffic limit to exceed
 
-	// Sender should not receive the message
-	sender.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-	buf := make([]byte, 64)
-	n, err := sender.Read(buf)
-	if err == nil && n > 0 {
-		t.Errorf("Sender should not receive its own message")
-	}
+	clientsMu.Lock()
+	clients[s1] = client1
+	clients[s2] = client2
+	clientsMu.Unlock()
 
-	// Check receiver1 got the message
-	receiver1.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-	buffer1 := make([]byte, len(message))
-	_, err = receiver1.Read(buffer1)
+	message := []byte("123456")
+	go BroadcastMessage(message, client1)
+
+	buf := make([]byte, 1024)
+	// Read and discard the first message
+	_, err := c2Conn.Read(buf)
 	if err != nil {
-		t.Fatalf("receiver1 failed to read: %v", err)
-	}
-	if !bytes.Equal(buffer1, message) {
-		t.Errorf("receiver1 got wrong message: %s", string(buffer1))
+		t.Fatalf("client2 did not receive first message: %v", err)
 	}
 
-	// Check receiver2 got the message
-	receiver2.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-	buffer2 := make([]byte, len(message))
-	_, err = receiver2.Read(buffer2)
+	// Read the second message (traffic limit warning)
+	receivedMessage, err := c2Conn.Read(buf)
 	if err != nil {
-		t.Fatalf("receiver2 failed to read: %v", err)
+		t.Fatalf("client2 did not receive second message: %v", err)
 	}
-	if !bytes.Equal(buffer2, message) {
-		t.Errorf("receiver2 got wrong message: %s", string(buffer2))
+
+	// Check if the server responded with the expected traffic limit message
+	if !strings.Contains(string(buf[:receivedMessage]), "Traffic limit reached") {
+		t.Errorf("Expected traffic limit message, got: %s", string(buf[:receivedMessage]))
+	}
+
+	// Expect client2 to be removed
+	clientsMu.Lock()
+	_, exists1 := clients[s1]
+	_, exists2 := clients[s2]
+	clientsMu.Unlock()
+	if !exists1 {
+		t.Errorf("client1 should still be connected")
+	}
+	if exists2 {
+		t.Errorf("client2 should have been disconnected after exceeding traffic limit")
 	}
 }
